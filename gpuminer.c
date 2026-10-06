@@ -193,6 +193,7 @@ typedef struct {
     unsigned char *win_seed;
     unsigned char *win_pk;
     volatile unsigned long long *total;
+    int quiet;
     uint64_t initial_base;        // per-thread resume point (for exact count)
     uint64_t final_base;          // counter_base at thread exit
     uint64_t win_counter;         // winner's absolute counter (winner only)
@@ -327,7 +328,7 @@ int main(int argc, char *argv[]) {
     if (sodium_init() < 0) return 1;
     if (argc >= 2 && !strcmp(argv[1], "--check")) return check_mode(argv[0]);
     if (argc < 2) {
-        printf("Usage: %s <PREFIX> [DEVICE_ID] [-t TID] [-b BATCH]\n", argv[0]);
+        printf("Usage: %s <PREFIX> [DEVICE_ID] [-t TID] [-b BATCH] [--salt HEX32] [--quiet]\n", argv[0]);
         printf("       %s --check   list OpenCL platforms/GPUs and exit\n", argv[0]);
         return 1;
     }
@@ -335,19 +336,32 @@ int main(int argc, char *argv[]) {
     size_t plen = strlen(prefix);
     unsigned char machine_salt[16];
     randombytes_buf(machine_salt, 16);
-    int explicit_device = 0;
+    int explicit_device = 0, explicit_salt = 0, quiet = 0;
     uint32_t base_tid = 0;
     size_t batch = 1 << 20;
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "-t") && i + 1 < argc) base_tid = (uint32_t)atoi(argv[++i]);
         else if (!strcmp(argv[i], "-b") && i + 1 < argc) batch = (size_t)atoll(argv[++i]);
-        else if (!explicit_device && argv[i][0] != '-') {
+        else if (strcmp(argv[i], "--salt") == 0 && i + 1 < argc) {
+            const char *hex = argv[++i];
+            if (strlen(hex) != 32) { fprintf(stderr, "[-] --salt needs 32 hex chars\n"); return 1; }
+            for (int b = 0; b < 16; b++) {
+                unsigned int v = 0;
+                if (sscanf(hex + 2 * b, "%2x", &v) != 1) {
+                    fprintf(stderr, "[-] --salt is not valid hex\n"); return 1;
+                }
+                machine_salt[b] = (unsigned char)v;
+            }
+            explicit_salt = 1; explicit_device = 1;
+        } else if (strcmp(argv[i], "--quiet") == 0) { quiet = 1; }
+        else if (!explicit_device && !explicit_salt && argv[i][0] != '-') {
             uint64_t dev = strtoull(argv[i], NULL, 10);
             memset(machine_salt, 0, 16);
             memcpy(machine_salt, &dev, 8);
             explicit_device = 1;
         }
     }
+    (void)explicit_salt;
 
     unsigned char target[33] = {0};
     unsigned full_bytes = 0; unsigned char mask = 0, top = 0;
@@ -376,6 +390,7 @@ int main(int argc, char *argv[]) {
     }
     if (ndev == 0) { fprintf(stderr, "no GPU devices found\n"); return 1; }
 
+    if (!quiet) {
     printf("==================================================\n");
     printf("[*] Target Prefix      : '%s' (%zu chars)\n", prefix, plen);
     printf("[*] Mode               : %s (OpenCL, %d GPU%s)\n",
@@ -388,6 +403,7 @@ int main(int argc, char *argv[]) {
     printf("[*] Expected Avg Hashes: %.3g\n", expected);
     printf("[*] Batch size         : %zu per GPU\n", batch);
     printf("==================================================\n\n");
+    }
 
     char *src[4] = { slurp("sha512_consts.cl"), slurp("fe25519.cl"),
                      slurp("ge25519.cl"), slurp("gpuminer.cl") };
@@ -410,6 +426,7 @@ int main(int argc, char *argv[]) {
         memcpy(args[i].target, target, 33);
         args[i].full_bytes = full_bytes; args[i].mask = mask; args[i].top = top;
         args[i].prefix = prefix; args[i].plen = plen; args[i].batch = batch;
+        args[i].quiet = quiet;
         for (int s = 0; s < 4; s++) args[i].src[s] = src[s];
         args[i].found = &found; args[i].win_lock = &win_lock;
         args[i].winner_tid = &winner_tid;
@@ -421,7 +438,7 @@ int main(int argc, char *argv[]) {
         FILE *cf = fopen(ckpt, "r");
         if (cf) {
             if (fscanf(cf, "%llu", (unsigned long long *)&base) == 1)
-                printf("[*] GPU %d resumed from counter %llu\n", i, (unsigned long long)base);
+                if (!quiet) printf("[*] GPU %d resumed from counter %llu\n", i, (unsigned long long)base);
             fclose(cf);
         }
         args[i].initial_base = base;
@@ -443,9 +460,11 @@ int main(int argc, char *argv[]) {
         char eta[32];
         if (speed > 0 && expected > (double)mined) format_time((expected - mined) / speed, eta, sizeof eta);
         else strcpy(eta, (double)mined >= expected ? "0s" : "calc");
-        printf("\r[*] Hashes: %llu (%.1f%% Avg) | Speed: %.0f H/s | ETA: %s   ",
-               mined, pct, speed, eta);
-        fflush(stdout);
+        if (!quiet) {
+            printf("\r[*] Hashes: %llu (%.1f%% Avg) | Speed: %.0f H/s | ETA: %s   ",
+                   mined, pct, speed, eta);
+            fflush(stdout);
+        }
     }
     for (int i = 0; i < ndev; i++) pthread_join(threads[i], NULL);
 
@@ -492,16 +511,24 @@ int main(int argc, char *argv[]) {
         safe[si] = 0;
         snprintf(outname, sizeof outname, "%s.sta2", safe);
     }
-    FILE *fp = fopen(outname, "w");
+    char tmpname[300];
+    snprintf(tmpname, sizeof tmpname, "%s.tmp.%u", outname, (unsigned)time(NULL) % 1000000u);
+    FILE *fp = fopen(tmpname, "w");
     if (!fp) {
-        fprintf(stderr, "[-] Error: Could not create %s\n", outname);
+        fprintf(stderr, "[-] Error: Could not create %s\n", tmpname);
         return 2;
     }
     fprintf(fp, "WZ.STA.v3\n");
     fprintf(fp, "10 10 454 902788 10\n");
     fprintf(fp, "%s\n", b64sk);
     if (fclose(fp) != 0) {
-        fprintf(stderr, "[-] Error: Failed writing %s\n", outname);
+        fprintf(stderr, "[-] Error: Failed writing %s\n", tmpname);
+        remove(tmpname);
+        return 2;
+    }
+    if (rename(tmpname, outname) != 0) {
+        fprintf(stderr, "[-] Error: Failed publishing %s\n", outname);
+        remove(tmpname);
         return 2;
     }
     printf("[+] Results successfully saved to '%s'\n", outname);

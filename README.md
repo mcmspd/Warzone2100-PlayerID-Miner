@@ -62,6 +62,19 @@ result is verified on the CPU (via libsodium) before saving. Progress,
  checkpoints (`.gpu_checkpoint_t*.txt`, per tid), and ETA print live;
  re-running resumes where it stopped. A failed `.sta2` write exits non-zero.
 
+## All workers at once (CPU + GPU)
+
+```sh
+./run.sh <PREFIX> [--cpu N|--no-cpu] [--no-gpu] [--salt HEX32]
+```
+
+Default uses every GPU plus all CPU cores under one shared salt, with
+disjoint `tid` partitions (GPUs `0..n-1`, CPU from `n`), so nothing is
+searched twice and a mixed cluster can split by tid ranges. Checkpoints
+are per-tid (`.gpu/cpu_checkpoint_t*.txt`); Ctrl-C stops everything with
+no strays (exit 130) and re-running resumes. `--no-cpu` / `--no-gpu`
+run a single worker type with its own foreground display instead.
+
 ## Both GPUs (NVIDIA + Intel iGPU on this machine)
 
 The Intel HD 630 needs the legacy NEO runtime (`intel-opencl-icd-legacy1

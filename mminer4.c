@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <sodium.h>
 #include <omp.h>
+#include <time.h>
 
 // Format numbers with commas (e.g. 1000000 -> "1,000,000")
 void format_number(uint64_t val, char *buf, size_t size) {
@@ -53,7 +54,7 @@ int main(int argc, char *argv[]) {
     }
 
     if (argc < 2) {
-        printf("Usage: %s <PREFIX> [DEVICE_ID] [-t THREADS]\n\n", argv[0]);
+        printf("Usage: %s <PREFIX> [DEVICE_ID] [-t THREADS] [--salt HEX32] [--tid-base N] [-o OFFSET] [--quiet]\n\n", argv[0]);
         printf("Examples:\n");
         printf("  %s VIP           # Auto-detects cores & uses random unique machine salt\n", argv[0]);
         printf("  %s VIP 1         # Uses explicit Device ID 1\n", argv[0]);
@@ -63,23 +64,50 @@ int main(int argc, char *argv[]) {
 
     char *target_prefix = argv[1];
     int num_threads = omp_get_max_threads();
+    uint32_t tid_base = 0;
+    uint64_t start_offset = 0;
+    int quiet = 0;
 
     // Default: generate a random 16-byte machine salt so multiple devices never overlap
     unsigned char machine_salt[16];
     randombytes_buf(machine_salt, sizeof(machine_salt));
     int explicit_device = 0;
+    int explicit_salt = 0;
 
     // Parse optional positional DEVICE_ID and optional -t THREADS flag
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
             num_threads = atoi(argv[++i]);
-        } else if (!explicit_device && argv[i][0] != '-') {
+        } else if (strcmp(argv[i], "--salt") == 0 && i + 1 < argc) {
+            const char *hex = argv[++i];
+            if (strlen(hex) != 32) {
+                fprintf(stderr, "[-] Error: --salt needs 32 hex chars (16 bytes)\n");
+                return 1;
+            }
+            for (int b = 0; b < 16; b++) {
+                unsigned int v = 0;
+                if (sscanf(hex + 2 * b, "%2x", &v) != 1) {
+                    fprintf(stderr, "[-] Error: --salt is not valid hex\n");
+                    return 1;
+                }
+                machine_salt[b] = (unsigned char)v;
+            }
+            explicit_salt = 1;
+            explicit_device = 1;
+        } else if (strcmp(argv[i], "--tid-base") == 0 && i + 1 < argc) {
+            tid_base = (uint32_t)strtoul(argv[++i], NULL, 10);
+        } else if ((strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--offset") == 0) && i + 1 < argc) {
+            start_offset = strtoull(argv[++i], NULL, 10);
+        } else if (strcmp(argv[i], "--quiet") == 0) {
+            quiet = 1;
+        } else if (!explicit_device && !explicit_salt && argv[i][0] != '-') {
             uint64_t dev_id = strtoull(argv[i], NULL, 10);
             memset(machine_salt, 0, sizeof(machine_salt));
             memcpy(machine_salt, &dev_id, sizeof(dev_id));
             explicit_device = 1;
         }
     }
+    if (num_threads < 1) num_threads = 1;
 
     int prefix_len = strlen(target_prefix);
 
@@ -121,10 +149,20 @@ int main(int argc, char *argv[]) {
         unsigned char seed[crypto_sign_SEEDBYTES] = {0};
         memcpy(seed, machine_salt, 16);
 
-        uint32_t thread_id = (uint32_t)tid;
+        uint32_t thread_id = tid_base + (uint32_t)tid;
         memcpy(seed + 16, &thread_id, sizeof(thread_id));
 
-        uint64_t counter = 0;
+        // Resume: per-tid checkpoint file wins over --offset.
+        uint64_t counter = start_offset;
+        char ckpt_path[128];
+        snprintf(ckpt_path, sizeof(ckpt_path), ".cpu_checkpoint_t%u.txt", thread_id);
+        FILE *ckf = fopen(ckpt_path, "r");
+        if (ckf) {
+            unsigned long long saved = 0;
+            if (fscanf(ckf, "%llu", &saved) == 1) counter = (uint64_t)saved;
+            fclose(ckf);
+        }
+        uint64_t since_ckpt = 0;
 
         unsigned char pk[crypto_sign_PUBLICKEYBYTES];
         unsigned char az[64]; // Temporary buffer for SHA-512 output
@@ -155,7 +193,14 @@ int main(int argc, char *argv[]) {
                 total_hashes += local_attempts;
                 local_attempts = 0;
 
-                if (tid == 0) {
+                since_ckpt += 5000;
+                if (since_ckpt >= 250000) {
+                    since_ckpt = 0;
+                    FILE *wf = fopen(ckpt_path, "w");
+                    if (wf) { fprintf(wf, "%llu\n", (unsigned long long)counter); fclose(wf); }
+                }
+
+                if (tid == 0 && !quiet) {
                     double now = omp_get_wtime();
                     if (now - last_hud_time >= 0.3) {
                         double elapsed = now - start_time;
@@ -242,10 +287,13 @@ int main(int argc, char *argv[]) {
         snprintf(output_filename, sizeof(output_filename), "%s.sta2", safe);
     }
 
-    FILE *fp = fopen(output_filename, "w"); // Uses write mode to generate the .sta2 file
+    // Atomic publish: concurrent workers (see run.sh) must never interleave.
+    char tmp_filename[300];
+    snprintf(tmp_filename, sizeof(tmp_filename), "%s.tmp.%u", output_filename, (unsigned)time(NULL) % 1000000u);
+    FILE *fp = fopen(tmp_filename, "w");
 
     if (fp == NULL) {
-        fprintf(stderr, "[-] Error: Could not create or open file %s\n", output_filename);
+        fprintf(stderr, "[-] Error: Could not create or open file %s\n", tmp_filename);
         return 2; // never report success when the key was not saved
     }
     fprintf(fp, "WZ.STA.v3\n");
@@ -253,7 +301,13 @@ int main(int argc, char *argv[]) {
     fprintf(fp, "%s\n", found_b64_sk);
 
     if (fclose(fp) != 0) {
-        fprintf(stderr, "[-] Error: Failed writing file %s\n", output_filename);
+        fprintf(stderr, "[-] Error: Failed writing file %s\n", tmp_filename);
+        remove(tmp_filename);
+        return 2;
+    }
+    if (rename(tmp_filename, output_filename) != 0) {
+        fprintf(stderr, "[-] Error: Failed publishing file %s\n", output_filename);
+        remove(tmp_filename);
         return 2;
     }
     printf("[+] Results successfully saved to '%s'\n", output_filename);
