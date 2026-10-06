@@ -13,6 +13,11 @@ found_keys.txt
 # Checkpoints
 .vanity_checkpoint_*.txt
 .gpu_checkpoint_*.txt
+.cpu_checkpoint_*.txt
+
+# Worker logs from combined runs
+.run_*.log
+bg*.log
 
 # Compiled kernel cache (regenerated automatically)
 .gpuminer_cache_*.bin
