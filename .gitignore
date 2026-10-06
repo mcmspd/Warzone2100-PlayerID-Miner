@@ -1,0 +1,32 @@
+# Binaries
+gpuminer
+miner
+mminer
+mminer2
+mminer3
+mminer4
+
+# User outputs — .sta2 files contain secret keys, never commit them
+*.sta2
+found_keys.txt
+
+# Checkpoints
+.vanity_checkpoint_*.txt
+.gpu_checkpoint_*.txt
+
+# Compiled kernel cache (regenerated automatically)
+.gpuminer_cache_*.bin
+
+# Build outputs
+dist/
+build/
+kernels_embed.c
+
+# Python
+__pycache__/
+*.pyc
+
+# Editors
+.vscode/
+*.swp
+*~

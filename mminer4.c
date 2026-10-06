@@ -227,21 +227,36 @@ int main(int argc, char *argv[]) {
     printf("--------------------------------------------------\n");
 
     // --- WRITE STA2 FORMAT OUTPUT TO FILE ---
+    // Sanitize: '/' is a valid Base64 char but a path separator on disk.
     char output_filename[256];
-    snprintf(output_filename, sizeof(output_filename), "%s.sta2", target_prefix);
+    {
+        char safe[200];
+        size_t si = 0;
+        for (size_t i = 0; target_prefix[i] && si < sizeof(safe) - 1; i++) {
+            char ch = target_prefix[i];
+            if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+                (ch >= '0' && ch <= '9') || ch == '+' || ch == '=') safe[si++] = ch;
+            else safe[si++] = '_';
+        }
+        safe[si] = 0;
+        snprintf(output_filename, sizeof(output_filename), "%s.sta2", safe);
+    }
 
     FILE *fp = fopen(output_filename, "w"); // Uses write mode to generate the .sta2 file
 
     if (fp == NULL) {
         fprintf(stderr, "[-] Error: Could not create or open file %s\n", output_filename);
-    } else {
-        fprintf(fp, "WZ.STA.v3\n");
-        fprintf(fp, "10 10 454 902788 10\n");
-        fprintf(fp, "%s\n", found_b64_sk);
-
-        fclose(fp);
-        printf("[+] Results successfully saved to '%s'\n", output_filename);
+        return 2; // never report success when the key was not saved
     }
+    fprintf(fp, "WZ.STA.v3\n");
+    fprintf(fp, "10 10 454 902788 10\n");
+    fprintf(fp, "%s\n", found_b64_sk);
+
+    if (fclose(fp) != 0) {
+        fprintf(stderr, "[-] Error: Failed writing file %s\n", output_filename);
+        return 2;
+    }
+    printf("[+] Results successfully saved to '%s'\n", output_filename);
 
     return 0;
 }
