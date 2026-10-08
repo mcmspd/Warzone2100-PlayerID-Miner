@@ -63,7 +63,10 @@ int main(int argc, char *argv[]) {
     }
 
     char *target_prefix = argv[1];
-    int num_threads = omp_get_max_threads();
+    // Default to 25% of cores: leaves package power/thermals for the iGPU
+    // (which shares the die budget) and dGPU host threads. Override with -t.
+    int num_threads = (omp_get_max_threads() + 3) / 4;
+    if (num_threads < 1) num_threads = 1;
     uint32_t tid_base = 0;
     uint64_t start_offset = 0;
     int quiet = 0;
