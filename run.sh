@@ -230,7 +230,8 @@ if ! preflight; then
 fi
 setup_intel_env
 
-# --- orchestration: all workers share one salt, disjoint tids ---
+# --- single binary: gpuminer runs GPUs + CPU workers under one salt ---
+# (GPUs tids 0.., CPU tids after; binary defaults CPU to 25% of cores)
 # Usage: run.sh PREFIX [-b BATCH] [--cpu N|--no-cpu] [--no-gpu] [--salt HEX]
 PREFIX=""
 BATCH=1048576
@@ -255,94 +256,21 @@ done
 if [ "$USE_GPU" = "0" ] && [ "$USE_CPU" = "0" ]; then
     echo "nothing to run (both --no-gpu and --no-cpu)"; exit 1
 fi
-
-# GPU-only: keep gpuminer's own foreground HUD.
+ARGS=()
+[ -n "$SALT" ] && ARGS+=(--salt "$SALT")
+ARGS+=(-b "$BATCH")
+[ "$USE_GPU" = "0" ] && ARGS+=(--no-gpu)
 if [ "$USE_CPU" = "0" ]; then
-    if [ -n "$SALT" ]; then exec ./gpuminer "$PREFIX" --salt "$SALT" -b "$BATCH" --quiet;
-    else exec ./gpuminer "$PREFIX" -b "$BATCH"; fi
-fi
-# CPU-only: keep mminer4's own foreground HUD.
-if [ "$USE_GPU" = "0" ]; then
-    [ -x ./mminer4 ] || make mminer4 || exit 1
-    if [ -z "$CPU_THREADS" ]; then CPU_THREADS=$(nproc 2>/dev/null || echo 4); fi
-    if [ -n "$SALT" ]; then exec ./mminer4 "$PREFIX" -t "$CPU_THREADS" --salt "$SALT";
-    else exec ./mminer4 "$PREFIX" -t "$CPU_THREADS"; fi
+    ARGS+=(--cpu 0)
+elif [ -n "$CPU_THREADS" ]; then
+    ARGS+=(--cpu "$CPU_THREADS")
 fi
 
-# Combined: GPUs (tids 0..ndev-1) + CPU (tids ndev..) under one salt.
-# Default CPU to 25% of cores: iGPU shares package power/thermals with the
-# CPU, and CPU H/J is worse, so full CPU starves the iGPU. Explicit --cpu N wins.
-[ -x ./mminer4 ] || make mminer4 || exit 1
-if [ -z "$CPU_THREADS" ]; then
-    _n=$(nproc 2>/dev/null || echo 4)
-    CPU_THREADS=$(( (_n + 3) / 4 ))
-    [ "$CPU_THREADS" -lt 1 ] && CPU_THREADS=1
-fi
-if [ -z "$SALT" ]; then SALT=$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n'); fi
-GPU_TIDS=$(./gpuminer --check 2>/dev/null | grep -c "^  gpu " || true)
+./gpuminer "$PREFIX" "${ARGS[@]}"
+RC=$?
+if [ "$RC" -ne 0 ]; then echo "[run.sh] gpuminer exited $RC"; exit "$RC"; fi
 STA="$(printf '%s' "$PREFIX" | tr -c 'A-Za-z0-9+=' '_').sta2"
-rm -f "$STA"
-GPU_LOG=.run_gpuminer.log; CPU_LOG=.run_mminer4.log
-: > "$GPU_LOG"; : > "$CPU_LOG"
-
-# snapshot resume points so the HUD counts this run only
-INIT_SUM=0
-for f in .gpu_checkpoint_t*.txt .cpu_checkpoint_t*.txt; do
-    [ -f "$f" ] || continue
-    v=$(cat "$f" 2>/dev/null); case "$v" in ''|*[!0-9]*) v=0 ;; esac
-    INIT_SUM=$((INIT_SUM + v))
-done
-PLEN=${#PREFIX}; [ "$PLEN" -gt 43 ] && PLEN=43
-EXPECTED=$(awk -v n="$PLEN" 'BEGIN{e=1; for(i=0;i<n;i++) e*=64; if (n==43) e/=4; printf "%.0f", e}')
-BUDGET=$(awk -v e="$EXPECTED" 'BEGIN{printf "%.0f", e*4.6052}')
-
-./gpuminer "$PREFIX" --salt "$SALT" -b "$BATCH" --quiet >>"$GPU_LOG" 2>&1 &
-GPU_PID=$!
-./mminer4 "$PREFIX" -t "$CPU_THREADS" --salt "$SALT" --tid-base "$GPU_TIDS" --quiet >>"$CPU_LOG" 2>&1 &
-CPU_PID=$!
-START=$(date +%s)
-INTERRUPTED=0
-# cleanup must be airtight: workers blocked in clFinish/OpenMP loops have
-# survived a bare TERM before, orphaning GPU-burning processes.
-cleanup() {
-    kill "$GPU_PID" "$CPU_PID" 2>/dev/null
-    for _ in $(seq 1 50); do
-        kill -0 "$GPU_PID" 2>/dev/null || kill -0 "$CPU_PID" 2>/dev/null || break
-        sleep 0.1
-    done
-    kill -9 "$GPU_PID" "$CPU_PID" 2>/dev/null
-    wait 2>/dev/null
-}
-onint() { INTERRUPTED=1; cleanup; }
-trap onint INT TERM
-echo "[run.sh] mining '$PREFIX' with $GPU_TIDS GPU(s) + $CPU_THREADS CPU threads (salt ${SALT:0:8}...) — Ctrl-C stops"
-while kill -0 "$GPU_PID" 2>/dev/null && kill -0 "$CPU_PID" 2>/dev/null && [ ! -f "$STA" ]; do
-    sleep 0.5
-    SUM=0
-    for f in .gpu_checkpoint_t*.txt .cpu_checkpoint_t*.txt; do
-        [ -f "$f" ] || continue
-        v=$(cat "$f" 2>/dev/null); case "$v" in ''|*[!0-9]*) v=0 ;; esac
-        SUM=$((SUM + v))
-    done
-    MINED=$((SUM - INIT_SUM)); [ "$MINED" -lt 0 ] && MINED=0
-    NOW=$(date +%s); EL=$((NOW - START)); [ "$EL" -lt 1 ] && EL=1
-    SPD=$((MINED / EL))
-    if [ "$SPD" -gt 0 ] && [ "$BUDGET" -gt "$MINED" ] 2>/dev/null; then
-        ETA_S=$(awk -v e="$BUDGET" -v m="$MINED" -v s="$SPD" 'BEGIN{printf "%d", (e-m)/s}')
-        if [ "$ETA_S" -lt 60 ]; then ETA="${ETA_S}s";
-        elif [ "$ETA_S" -lt 3600 ]; then ETA="$((ETA_S/60))m $((ETA_S%60))s";
-        elif [ "$ETA_S" -lt 86400 ]; then ETA="$((ETA_S/3600))h $(((ETA_S%3600)/60))m";
-        else ETA="$((ETA_S/86400))d $(((ETA_S%86400)/3600))h"; fi
-    else ETA="--"; fi
-    printf "\r[*] Hashes: %s | Speed: %s H/s | ETA (99%%): %s   " "$(printf "%'d" "$MINED" 2>/dev/null || echo "$MINED")" "$(printf "%'d" "$SPD" 2>/dev/null || echo "$SPD")" "$ETA"
-done
-echo
-cleanup
-trap - INT TERM
-if [ ! -f "$STA" ]; then
-    if [ "$INTERRUPTED" = "1" ]; then echo "[run.sh] interrupted; progress kept in checkpoint files."; exit 130; fi
-    echo "[run.sh] workers exited without a result; see $GPU_LOG $CPU_LOG"; exit 1
-fi
+if [ ! -f "$STA" ]; then echo "[run.sh] no result file produced"; exit 1; fi
 
 # verify + identify winner
 if have python3 && python3 -c "import nacl" 2>/dev/null; then
@@ -360,9 +288,5 @@ import base64,sys
 sk = base64.b64decode(open(sys.argv[1]).read().splitlines()[2])
 print(int.from_bytes(sk[16:20], 'little'))
 " "$STA" 2>/dev/null || echo "?")
-if [ "$WTID" != "?" ] && [ "$WTID" -lt "$GPU_TIDS" ] 2>/dev/null; then
-    echo "[run.sh] winner: GPU tid $WTID"
-else
-    echo "[run.sh] winner: CPU tid $WTID"
-fi
+echo "[run.sh] winner: tid $WTID"
 exit 0

@@ -12,6 +12,7 @@
 #include <stdint.h>
 #include <time.h>
 #include <pthread.h>
+#include <unistd.h>
 
 static void chk(cl_int e, const char *w) {
     if (e != CL_SUCCESS) { fprintf(stderr, "OpenCL FAIL %s: %d\n", w, e); exit(1); }
@@ -325,6 +326,92 @@ static void *worker(void *arg_) {
     return NULL;
 }
 
+typedef struct {
+    uint32_t tid;
+    unsigned char salt[16];
+    const char *prefix;
+    size_t plen;
+    volatile int *found;
+    pthread_mutex_t *win_lock;
+    int *winner_tid;
+    unsigned char *win_seed;
+    unsigned char *win_pk;
+    volatile unsigned long long *total;
+    uint64_t initial_base;      // resume point
+    uint64_t final_base;        // counter at exit (exact: 1 candidate/iter)
+    uint64_t win_counter;       // winner's absolute counter (winner only)
+} cpu_worker_arg;
+
+static void *cpu_worker(void *arg_) {
+    cpu_worker_arg *a = (cpu_worker_arg *)arg_;
+    // Seed layout identical to GPU kernel and mminer4:
+    // salt[16] + tid[4 LE] + counter[8 LE] + pad[4].
+    unsigned char seed[crypto_sign_SEEDBYTES] = {0};
+    memcpy(seed, a->salt, 16);
+    memcpy(seed + 16, &a->tid, 4);
+
+    uint64_t counter = 0;
+    char ckpt[128]; snprintf(ckpt, sizeof ckpt, ".cpu_checkpoint_t%u.txt", a->tid);
+    FILE *cf = fopen(ckpt, "r");
+    if (cf) {
+        unsigned long long saved = 0;
+        if (fscanf(cf, "%llu", &saved) == 1) counter = (uint64_t)saved;
+        fclose(cf);
+    }
+    a->initial_base = counter;
+    uint64_t since_ckpt = 0, local = 0;
+
+    unsigned char pk[crypto_sign_PUBLICKEYBYTES];
+    unsigned char az[64];
+    char b64[sodium_base64_ENCODED_LEN(crypto_sign_PUBLICKEYBYTES, sodium_base64_VARIANT_ORIGINAL)];
+
+    while (!__atomic_load_n(a->found, __ATOMIC_ACQUIRE)) {
+        memcpy(seed + 20, &counter, 8);
+        counter++;
+
+        crypto_hash_sha512(az, seed, crypto_sign_SEEDBYTES);
+        az[0] &= 248;
+        az[31] &= 127;
+        az[31] |= 64;
+        crypto_scalarmult_ed25519_base_noclamp(pk, az);
+        sodium_bin2base64(b64, sizeof b64, pk, sizeof(pk), sodium_base64_VARIANT_ORIGINAL);
+
+        if (++local >= 5000) {
+            __atomic_fetch_add(a->total, (unsigned long long)local, __ATOMIC_RELAXED);
+            local = 0;
+            since_ckpt += 5000;
+            if (since_ckpt >= 250000) {
+                since_ckpt = 0;
+                FILE *wf = fopen(ckpt, "w");
+                if (wf) { fprintf(wf, "%llu\n", (unsigned long long)counter); fclose(wf); }
+            }
+        }
+
+        if (strncmp(b64, a->prefix, a->plen) == 0) {
+            // Re-derive full keypair (paranoia check, mirrors GPU re-verify).
+            unsigned char vpk[crypto_sign_PUBLICKEYBYTES], vsk[crypto_sign_SECRETKEYBYTES];
+            crypto_sign_seed_keypair(vpk, vsk, seed);
+            char bv[64];
+            sodium_bin2base64(bv, sizeof bv, vpk, 32, sodium_base64_VARIANT_ORIGINAL);
+            if (strncmp(bv, a->prefix, a->plen) != 0) continue;
+            __atomic_fetch_add(a->total, (unsigned long long)local, __ATOMIC_RELAXED);
+            int expected = 0;
+            if (__atomic_compare_exchange_n(a->found, &expected, 1, 0,
+                                            __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+                pthread_mutex_lock(a->win_lock);
+                *a->winner_tid = (int)a->tid;
+                a->win_counter = counter - 1;
+                memcpy(a->win_seed, seed, 32);
+                memcpy(a->win_pk, vpk, 32);
+                pthread_mutex_unlock(a->win_lock);
+            }
+            break;
+        }
+    }
+    a->final_base = counter;
+    return NULL;
+}
+
 static int check_mode(const char *prog) {
     // Doctor mode for run.sh preflight: list OpenCL platforms/GPUs.
     (void)prog;
@@ -357,8 +444,22 @@ static int check_mode(const char *prog) {
 int main(int argc, char *argv[]) {
     if (sodium_init() < 0) return 1;
     if (argc >= 2 && !strcmp(argv[1], "--check")) return check_mode(argv[0]);
+    if (argc >= 2 && (!strcmp(argv[1], "-h") || !strcmp(argv[1], "--help"))) {
+        argc = 1;  // fall through to usage below
+    }
     if (argc < 2) {
-        printf("Usage: %s <PREFIX> [DEVICE_ID] [-t TID] [-b BATCH] [--salt HEX32] [--quiet] [--profile] [-l LOCAL]\n", argv[0]);
+        printf("Usage: %s <PREFIX> [DEVICE_ID] [options]\n", argv[0]);
+        printf("  PREFIX            wanted leading Player ID chars (base64 alphabet)\n");
+        printf("  DEVICE_ID         numeric salt so clustered machines never overlap\n");
+        printf("  -t TID            base thread id: GPUs get TID+i, CPUs follow (default 0)\n");
+        printf("  -b BATCH          candidates per GPU per launch (default 1048576)\n");
+        printf("  -l LOCAL          work-group size, 0 = driver default (tune with bench.sh -l)\n");
+        printf("  --salt HEX32      explicit 16-byte salt (default: random)\n");
+        printf("  --cpu N           CPU worker threads (default: 25%% of cores with GPUs, all without)\n");
+        printf("  --no-cpu          no CPU workers (same as --cpu 0)\n");
+        printf("  --no-gpu          no GPU workers (CPU default becomes all cores)\n");
+        printf("  --quiet           no progress display, result still printed\n");
+        printf("  --profile         per-batch kernel vs round-trip ms to stderr\n");
         printf("       %s --check   list OpenCL platforms/GPUs and exit\n", argv[0]);
         return 1;
     }
@@ -366,7 +467,8 @@ int main(int argc, char *argv[]) {
     size_t plen = strlen(prefix);
     unsigned char machine_salt[16];
     randombytes_buf(machine_salt, 16);
-    int explicit_device = 0, explicit_salt = 0, quiet = 0, profile = 0;
+    int explicit_device = 0, explicit_salt = 0, quiet = 0, profile = 0, no_gpu = 0;
+    long cpu_threads = -1;  // -1 = auto (25% of cores)
     uint32_t base_tid = 0;
     size_t batch = 1 << 20;
     size_t local = 0;
@@ -387,6 +489,9 @@ int main(int argc, char *argv[]) {
             explicit_salt = 1; explicit_device = 1;
         } else if (strcmp(argv[i], "--quiet") == 0) { quiet = 1; }
         else if (strcmp(argv[i], "--profile") == 0) { profile = 1; }
+        else if (!strcmp(argv[i], "--cpu") && i + 1 < argc) cpu_threads = atol(argv[++i]);
+        else if (!strcmp(argv[i], "--no-cpu")) cpu_threads = 0;
+        else if (!strcmp(argv[i], "--no-gpu")) no_gpu = 1;
         else if (!explicit_device && !explicit_salt && argv[i][0] != '-') {
             uint64_t dev = strtoull(argv[i], NULL, 10);
             memset(machine_salt, 0, 16);
@@ -405,11 +510,14 @@ int main(int argc, char *argv[]) {
     if (plen == 43) expected /= 4;
     double budget = expected * 4.6052;  // 99% worst case (ln 100): plan for this
 
-    // Enumerate all GPUs on all platforms
+    // CPU default resolves after enumeration (depends on ndev); see below.
+
+    // Enumerate all GPUs on all platforms (skipped with --no-gpu)
     cl_platform_id plats[8]; cl_uint nplat = 0;
-    chk(clGetPlatformIDs(8, plats, &nplat), "plats");
     typedef struct { cl_platform_id p; cl_device_id d; char pn[128], dn[128]; } devinfo;
     devinfo devs[16]; int ndev = 0;
+    if (!no_gpu) {
+    chk(clGetPlatformIDs(8, plats, &nplat), "plats");
     for (cl_uint pi = 0; pi < nplat && ndev < 16; pi++) {
         cl_device_id ds[16]; cl_uint nd = 0;
         if (clGetDeviceIDs(plats[pi], CL_DEVICE_TYPE_GPU, 16, ds, &nd) != CL_SUCCESS) continue;
@@ -422,17 +530,32 @@ int main(int argc, char *argv[]) {
             ndev++;
         }
     }
-    if (ndev == 0) { fprintf(stderr, "no GPU devices found\n"); return 1; }
+    }
+    if (ndev == 0 && cpu_threads == 0) {
+        fprintf(stderr, "no workers: no GPU devices found and --cpu 0\n"); return 1;
+    }
+    // CPU workers default to 25% of cores when GPUs share the package
+    // budget, or all cores when there is no GPU to protect.
+    if (cpu_threads < 0) {
+        long nc = sysconf(_SC_NPROCESSORS_ONLN);
+        if (nc < 1) nc = 4;
+        cpu_threads = (ndev == 0) ? nc : (nc + 3) / 4;
+        if (cpu_threads < 1) cpu_threads = 1;
+    }
+    uint32_t cpu_tid_base = base_tid + (uint32_t)ndev;
 
     if (!quiet) {
     printf("==================================================\n");
     printf("[*] Target Prefix      : '%s' (%zu chars)\n", prefix, plen);
-    printf("[*] Mode               : %s (OpenCL, %d GPU%s)\n",
+    printf("[*] Mode               : %s (%d GPU%s + %ld CPU thread%s)\n",
            explicit_device ? "Manual Device ID" : "Auto-Random Device Salt",
-           ndev, ndev > 1 ? "s" : "");
+           ndev, ndev == 1 ? "" : "s", cpu_threads, cpu_threads == 1 ? "" : "s");
     for (int i = 0; i < ndev; i++)
         printf("[*] GPU %d                : %s [%s] (tid %u)\n",
                i, devs[i].dn, devs[i].pn, base_tid + i);
+    if (cpu_threads > 0)
+        printf("[*] CPU threads        : %ld (tids %u..%u)\n",
+               cpu_threads, cpu_tid_base, cpu_tid_base + (uint32_t)cpu_threads - 1);
     printf("[*] GPU match bytes    : %u full + %s\n", full_bytes, mask ? "partial" : "none");
     printf("[*] Expected Avg Hashes: %.3g\n", expected);
     printf("[*] 99%% Budget Hashes  : %.3g (plan for this)\n", budget);
@@ -450,9 +573,10 @@ int main(int argc, char *argv[]) {
     int winner_tid = -1;
     unsigned char win_seed[32] = {0}, win_pk[32] = {0};
 
-    pthread_t *threads = malloc(sizeof(pthread_t) * ndev);
-    worker_arg *args = calloc(ndev, sizeof(worker_arg)); // zeroed: dev_matched/dev_fctr/final_base
-    if (!args) { fprintf(stderr, "out of memory\n"); return 1; }
+    pthread_t *threads = malloc(sizeof(pthread_t) * (ndev + cpu_threads));
+    worker_arg *args = calloc(ndev > 0 ? ndev : 1, sizeof(worker_arg)); // zeroed
+    cpu_worker_arg *cargs = calloc(cpu_threads > 0 ? cpu_threads : 1, sizeof(cpu_worker_arg));
+    if (!threads || !args || !cargs) { fprintf(stderr, "out of memory\n"); return 1; }
     for (int i = 0; i < ndev; i++) {
         args[i].plat = devs[i].p; args[i].dev = devs[i].d;
         snprintf(args[i].plat_name, sizeof args[i].plat_name, "%s", devs[i].pn);
@@ -480,6 +604,17 @@ int main(int argc, char *argv[]) {
         args[i].initial_base = base;
         chk(pthread_create(&threads[i], NULL, worker, &args[i]), "thread");
     }
+    for (long ci = 0; ci < cpu_threads; ci++) {
+        cargs[ci].tid = cpu_tid_base + (uint32_t)ci;
+        memcpy(cargs[ci].salt, machine_salt, 16);
+        cargs[ci].prefix = prefix; cargs[ci].plen = plen;
+        cargs[ci].found = &found; cargs[ci].win_lock = &win_lock;
+        cargs[ci].winner_tid = &winner_tid;
+        cargs[ci].win_seed = win_seed; cargs[ci].win_pk = win_pk;
+        cargs[ci].total = &total;
+        // cpu_worker reads its own checkpoint and sets initial_base
+        chk(pthread_create(&threads[ndev + ci], NULL, cpu_worker, &cargs[ci]), "cpu thread");
+    }
 
     struct timespec ts_start, ts_now;
     clock_gettime(CLOCK_MONOTONIC, &ts_start);
@@ -503,6 +638,7 @@ int main(int argc, char *argv[]) {
         }
     }
     for (int i = 0; i < ndev; i++) pthread_join(threads[i], NULL);
+    for (long ci = 0; ci < cpu_threads; ci++) pthread_join(threads[ndev + ci], NULL);
 
     clock_gettime(CLOCK_MONOTONIC, &ts_now);
     double elapsed = (ts_now.tv_sec - ts_start.tv_sec)
@@ -518,7 +654,10 @@ int main(int argc, char *argv[]) {
         if (args[i].dev_matched && args[i].dev_fctr + 1 >= args[i].final_base - batch)
             mined -= args[i].final_base - (args[i].dev_fctr + 1);
     }
-    printf("\n\n[+] MATCH FOUND in %.2fs! (GPU tid %d)\n", elapsed, winner_tid);
+    for (long ci = 0; ci < cpu_threads; ci++)
+        mined += cargs[ci].final_base - cargs[ci].initial_base;  // exact, no batch tail
+    const char *wkind = (cpu_threads > 0 && winner_tid >= (int)cpu_tid_base) ? "CPU" : "GPU";
+    printf("\n\n[+] MATCH FOUND in %.2fs! (%s tid %d)\n", elapsed, wkind, winner_tid);
     printf("--------------------------------------------------\n");
     printf("Total Hashes Mined : %llu\n", mined);
     printf("Average Speed      : %.0f H/s\n", elapsed > 0 ? (double)mined / elapsed : 0);

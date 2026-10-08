@@ -67,14 +67,16 @@ result is verified on the CPU (via libsodium) before saving. Progress,
 
 ```sh
 ./run.sh <PREFIX> [--cpu N|--no-cpu] [--no-gpu] [--salt HEX32]
+# or directly: ./gpuminer <PREFIX> [--cpu N] [--no-cpu] [--no-gpu]
 ```
 
-Default uses every GPU plus all CPU cores under one shared salt, with
+One binary runs every GPU plus CPU workers under one shared salt, with
 disjoint `tid` partitions (GPUs `0..n-1`, CPU from `n`), so nothing is
-searched twice and a mixed cluster can split by tid ranges. Checkpoints
-are per-tid (`.gpu/cpu_checkpoint_t*.txt`); Ctrl-C stops everything with
-no strays (exit 130) and re-running resumes. `--no-cpu` / `--no-gpu`
-run a single worker type with its own foreground display instead.
+searched twice and a mixed cluster can split by tid ranges. CPU defaults
+to 25% of cores (package budget is shared with the iGPU); `--cpu N`
+overrides, `--cpu 0`/`--no-cpu` disables. Checkpoints are per-tid
+(`.gpu/cpu_checkpoint_t*.txt`); Ctrl-C stops and re-running resumes.
+`mminer4` remains as the standalone CPU reference miner.
 
 ## Both GPUs (NVIDIA + Intel iGPU on this machine)
 
@@ -127,8 +129,8 @@ not measured.
   R570+ drivers (conformant since R465). Estimates only: ~30–50x a
   GTX 1050 Ti (~10–18M H/s on a 5090), 6-char prefix in ~1–2 h.
   Our kernel is occupancy-bound, so measure, don't trust the estimate.
-- **No GPU at all**: `gpuminer` exits cleanly; `./run.sh <PREFIX> --no-gpu`
-  falls back to the OpenMP CPU miner.
+- **No GPU at all**: `./run.sh <PREFIX> --no-gpu` (or `gpuminer --no-gpu`)
+  runs the built-in CPU workers instead.
 - **`make dist` binaries**: need glibc >= the build machine's (2.44 here)
   plus the target's own GPU driver stack. Little-endian x86-64 assumed
   (seed `tid`/`counter` are raw `memcpy` little-endian on the host).

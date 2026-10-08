@@ -198,7 +198,7 @@ NVIDIA unchanged (378k) — total 533k→550k H/s. NVIDIA is bound in the
 (64 beat driver default +3% on the old kernel). Third cut: width-5
 fixed-base schedule (`gen_ge.py` emits `GE_BASE5[26][16]`, 52 adds + x32
 middle vs 64 adds; all 416 entries round-trip-validated against libsodium,
-and the `bench.sh` count tripwire stayed bit-identical at 12,582,912).
+and the `bench.sh` winner stayed fixed across the validation runs.
 588k→676k H/s at `l=64` (+15%); retune moved the optimum to `l=32` at
 **684k H/s (+28% over the 533k baseline)**. Binary default stays driver
 (`-l 0`); tune per device with `bench.sh -l` (optima differ per GPU and
@@ -295,12 +295,12 @@ unhittable 6-char prefix `SOAKIT` — 6 chars ≈ 6 days expected, so it never
 hits inside the window — bringing the chassis to thermal steady state at
 the same power profile as the measurement. Phase 2 wipes bench checkpoints
 and mines fixed 4-char prefix `TEST`. Same salt+tid+counter ⇒ same key
-stream, so the match lands on the same counter every run: calibrated
-**12,582,912 hashes (~22 s dual-GPU here)**, verified identical 4/4 runs (including a 150 s heat-soaked run: same count,
-571,950 H/s — GPU-only path is thermally stable, so soak mainly matters
-for combined CPU+GPU comparisons).
-Metric is `hashes/elapsed`; only wall-clock varies, so kernel/host changes
-compare apples-to-apples. Bench tids never collide with production
+stream, so the winner (tid 65, counter 7,727,581 — decoded from the `.sta2`)
+is bit-identical every run; only wall-clock and the loser's ±1-batch tail
+vary, so H/s compares apples-to-apples. Calibrated **~12M hashes (~22 s
+dual-GPU here)**. The crypto tripwire is the winner identity, not the
+total: a broken kernel/schedule changes the winner or never finishes.
+Bench tids never collide with production
 (0,1...). Compare runs at the same thermal state (back-to-back, note
 `PkgTmp`), since sustained mining power-throttles cores (see power notes
 in §4.1/§4.3).
