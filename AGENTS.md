@@ -189,6 +189,12 @@ passes on GPU-mined keys). The gap to projection is register pressure
 occupancy — optimization work, not correctness work. Even at 2x, a 5-char
 prefix drops from ~2.2 h to ~50 min and 6-char from ~6 d to ~2.2 d.
 Measured: `TEST` (4 chars, 16.6M hashes) in 47 s; `ZZ` (2 chars) in 0.02 s.
+`--profile` (per-batch kernel vs round-trip to stderr) shows the kernel is
+100% of batch time on NVIDIA, 84% on Intel — host sync is negligible, so
+remaining headroom is all in the kernel. First cut done: SHA-512 `w[80]`
+→ 16-word sliding window (`gpuminer.cl`) gave Intel +11% (155k→172k H/s),
+NVIDIA unchanged (378k) — total 533k→550k H/s. NVIDIA is bound in the
+`ge` chain, not SHA registers.
 
 Files: `gpuminer.c` (host: work distribution, checkpoint/resume, `.sta2`
 output) + `gpuminer.cl` (mine kernel: seed→SHA-512→clamp→`ge_scalarmult_base`→
@@ -272,6 +278,24 @@ Intel data points: our kernel builds unmodified on IGC and the full
 seed→pubkey pipeline validates 256/256 vs libsodium on the iGPU too.
 `gpuminer` needs `-pthread` (one host thread per device) and per-tid
 checkpoint files already keep the partitions resumable independently.
+
+### 4.4 Deterministic benchmark (`bench.sh`, `make bench`)
+
+`./bench.sh` runs two phases on fixed salt `01020304...0e0f10`, tids 64/65,
+batch 1048576. Phase 1 (soak, default 150 s, `--no-soak` to skip) mines
+unhittable 6-char prefix `SOAKIT` — 6 chars ≈ 6 days expected, so it never
+hits inside the window — bringing the chassis to thermal steady state at
+the same power profile as the measurement. Phase 2 wipes bench checkpoints
+and mines fixed 4-char prefix `TEST`. Same salt+tid+counter ⇒ same key
+stream, so the match lands on the same counter every run: calibrated
+**12,582,912 hashes (~22 s dual-GPU here)**, verified identical 4/4 runs (including a 150 s heat-soaked run: same count,
+571,950 H/s — GPU-only path is thermally stable, so soak mainly matters
+for combined CPU+GPU comparisons).
+Metric is `hashes/elapsed`; only wall-clock varies, so kernel/host changes
+compare apples-to-apples. Bench tids never collide with production
+(0,1...). Compare runs at the same thermal state (back-to-back, note
+`PkgTmp`), since sustained mining power-throttles cores (see power notes
+in §4.1/§4.3).
 
 ## 5. Probability model
 

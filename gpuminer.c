@@ -194,6 +194,7 @@ typedef struct {
     unsigned char *win_pk;
     volatile unsigned long long *total;
     int quiet;
+    int profile;                // per-batch kernel vs round-trip timing to stderr
     uint64_t initial_base;        // per-thread resume point (for exact count)
     uint64_t final_base;          // counter_base at thread exit
     uint64_t win_counter;         // winner's absolute counter (winner only)
@@ -205,7 +206,8 @@ static void *worker(void *arg_) {
     worker_arg *a = (worker_arg *)arg_;
     cl_int err;
     cl_context ctx = clCreateContext(NULL, 1, &a->dev, NULL, NULL, &err); chk(err, "ctx");
-    cl_command_queue q = clCreateCommandQueue(ctx, a->dev, 0, &err); chk(err, "queue");
+    cl_command_queue q = clCreateCommandQueue(ctx, a->dev,
+        a->profile ? CL_QUEUE_PROFILING_ENABLE : 0, &err); chk(err, "queue");
     const char *srcs[4] = { (const char *)a->src[0], (const char *)a->src[1],
                             (const char *)a->src[2], (const char *)a->src[3] };
     cl_program prog = build_cached(ctx, a->dev, srcs, "-cl-std=CL1.2", a->dev_name);
@@ -233,14 +235,34 @@ static void *worker(void *arg_) {
     uint64_t counter_base = a->initial_base;
     char ckpt[128]; snprintf(ckpt, sizeof ckpt, ".gpu_checkpoint_t%u.txt", a->tid);
     size_t global = a->batch;
+    unsigned long long prof_n = 0, prof_kns = 0, prof_rns = 0;
 
     while (!__atomic_load_n(a->found, __ATOMIC_ACQUIRE)) {
         cl_uint zero = 0;
         chk(clEnqueueWriteBuffer(q, b_flag, CL_TRUE, 0, sizeof zero, &zero, 0, NULL, NULL), "wflag");
         cl_ulong cb = counter_base;
         chk(clSetKernelArg(k, 1, sizeof cb, &cb), "s1");
-        chk(clEnqueueNDRangeKernel(q, k, 1, NULL, &global, NULL, 0, NULL, NULL), "launch");
+        struct timespec rt0, rt1;
+        if (a->profile) clock_gettime(CLOCK_MONOTONIC, &rt0);
+        cl_event ev = NULL;
+        chk(clEnqueueNDRangeKernel(q, k, 1, NULL, &global, NULL, 0, NULL, a->profile ? &ev : NULL), "launch");
         chk(clFinish(q), "finish");
+        if (a->profile) {
+            clock_gettime(CLOCK_MONOTONIC, &rt1);
+            cl_ulong ks = 0, ke = 0;
+            clGetEventProfilingInfo(ev, CL_PROFILING_COMMAND_START, sizeof ks, &ks, NULL);
+            clGetEventProfilingInfo(ev, CL_PROFILING_COMMAND_END, sizeof ke, &ke, NULL);
+            clReleaseEvent(ev);
+            prof_n++;
+            prof_kns += ke - ks;
+            prof_rns += (unsigned long long)(rt1.tv_sec - rt0.tv_sec) * 1000000000ull
+                      + (unsigned long long)(rt1.tv_nsec - rt0.tv_nsec);
+            if (prof_n % 20 == 0)
+                fprintf(stderr, "[prof] %s tid %u batches %llu kernel %.3f ms/avg roundtrip %.3f ms/avg (%.1f%% kernel)\n",
+                        a->dev_name, a->tid, prof_n,
+                        (double)prof_kns / prof_n / 1e6, (double)prof_rns / prof_n / 1e6,
+                        prof_rns ? 100.0 * (double)prof_kns / prof_rns : 0.0);
+        }
 
         cl_uint flag = 0;
         chk(clEnqueueReadBuffer(q, b_flag, CL_TRUE, 0, sizeof flag, &flag, 0, NULL, NULL), "rflag");
@@ -328,7 +350,7 @@ int main(int argc, char *argv[]) {
     if (sodium_init() < 0) return 1;
     if (argc >= 2 && !strcmp(argv[1], "--check")) return check_mode(argv[0]);
     if (argc < 2) {
-        printf("Usage: %s <PREFIX> [DEVICE_ID] [-t TID] [-b BATCH] [--salt HEX32] [--quiet]\n", argv[0]);
+        printf("Usage: %s <PREFIX> [DEVICE_ID] [-t TID] [-b BATCH] [--salt HEX32] [--quiet] [--profile]\n", argv[0]);
         printf("       %s --check   list OpenCL platforms/GPUs and exit\n", argv[0]);
         return 1;
     }
@@ -336,7 +358,7 @@ int main(int argc, char *argv[]) {
     size_t plen = strlen(prefix);
     unsigned char machine_salt[16];
     randombytes_buf(machine_salt, 16);
-    int explicit_device = 0, explicit_salt = 0, quiet = 0;
+    int explicit_device = 0, explicit_salt = 0, quiet = 0, profile = 0;
     uint32_t base_tid = 0;
     size_t batch = 1 << 20;
     for (int i = 2; i < argc; i++) {
@@ -354,6 +376,7 @@ int main(int argc, char *argv[]) {
             }
             explicit_salt = 1; explicit_device = 1;
         } else if (strcmp(argv[i], "--quiet") == 0) { quiet = 1; }
+        else if (strcmp(argv[i], "--profile") == 0) { profile = 1; }
         else if (!explicit_device && !explicit_salt && argv[i][0] != '-') {
             uint64_t dev = strtoull(argv[i], NULL, 10);
             memset(machine_salt, 0, 16);
@@ -426,7 +449,7 @@ int main(int argc, char *argv[]) {
         memcpy(args[i].target, target, 33);
         args[i].full_bytes = full_bytes; args[i].mask = mask; args[i].top = top;
         args[i].prefix = prefix; args[i].plen = plen; args[i].batch = batch;
-        args[i].quiet = quiet;
+        args[i].quiet = quiet; args[i].profile = profile;
         for (int s = 0; s < 4; s++) args[i].src[s] = src[s];
         args[i].found = &found; args[i].win_lock = &win_lock;
         args[i].winner_tid = &winner_tid;

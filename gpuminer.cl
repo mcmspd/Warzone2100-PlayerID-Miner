@@ -39,8 +39,9 @@ __kernel void mine(
     seed[26] = (uchar)(counter >> 48); seed[27] = (uchar)(counter >> 56);
     seed[28] = 0; seed[29] = 0; seed[30] = 0; seed[31] = 0;
 
-    // SHA-512(seed)
-    ulong w[80];
+    // SHA-512(seed): single 1024-bit block. 16-word sliding window
+    // instead of w[80] (640B of registers per work-item) for occupancy.
+    ulong w[16];
     #define LDWORD(k) (((ulong)seed[(k)*8+0] << 56) | ((ulong)seed[(k)*8+1] << 48) | \
                         ((ulong)seed[(k)*8+2] << 40) | ((ulong)seed[(k)*8+3] << 32) | \
                         ((ulong)seed[(k)*8+4] << 24) | ((ulong)seed[(k)*8+5] << 16) | \
@@ -50,12 +51,12 @@ __kernel void mine(
     w[4] = 0x8000000000000000UL;
     for (int t = 5; t < 14; t++) w[t] = 0;
     w[14] = 0; w[15] = 256;
-    for (int t = 16; t < 80; t++)
-        w[t] = s1(w[t-2]) + w[t-7] + s0(w[t-15]) + w[t-16];
     ulong a = SHA512_H0[0], b = SHA512_H0[1], c = SHA512_H0[2], dd = SHA512_H0[3];
     ulong e = SHA512_H0[4], f = SHA512_H0[5], g = SHA512_H0[6], hh = SHA512_H0[7];
     for (int t = 0; t < 80; t++) {
-        ulong t1 = hh + S1(e) + Ch(e, f, g) + SHA512_K[t] + w[t];
+        if (t >= 16)
+            w[t & 15] = s1(w[(t-2) & 15]) + w[(t-7) & 15] + s0(w[(t-15) & 15]) + w[(t-16) & 15];
+        ulong t1 = hh + S1(e) + Ch(e, f, g) + SHA512_K[t] + w[t & 15];
         ulong t2 = S0(a) + Maj(a, b, c);
         hh = g; g = f; f = e; e = dd + t1;
         dd = c; c = b; b = a; a = t1 + t2;

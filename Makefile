@@ -32,6 +32,10 @@ check: gpuminer
 	./gpuminer ZZ -b 1048576
 	python3 test_property.py ZZ.sta2 ZZ
 
+# Deterministic benchmark from AGENTS.md §4.4 (fixed salt/tids/prefix)
+bench: gpuminer
+	./bench.sh
+
 # Portable build: single binary + static libsodium, kernels embedded.
 # Dynamic deps left: libc + libOpenCL + libdl (the GPU driver stack, which
 # cannot be static — OpenCL finds drivers via dlopen by design).
