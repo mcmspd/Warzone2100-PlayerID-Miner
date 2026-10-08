@@ -109,16 +109,26 @@ throughput gap. Only worth keeping C if you need many more cores per host or
 plan a GPU path (§7).
 
 Single-machine ETA at 133k H/s:
-
 | prefix | expected hashes | time |
 |---|---|---|
 | 3 chars | 262,144 | ~2 s |
 | 4 chars | 16,777,216 | ~2 min |
 | 5 chars | 1,073,741,824 | ~2.2 h |
 | 6 chars | 68,719,476,736 | ~6 days |
+| 7 chars | 4,398,046,511,104 | ~3.2 mo (single RTX 5090-class: ~3 d) |
+| 8 chars | 281,474,976,710,656 | ~17 y (**not feasible here**; needs ~109 MH/s for a 30-day mean — see below) |
 
 6+ characters is realistically a multi-device project. The user should be told
 this up front rather than discovering it at hour 6.
+
+**Efficiency (throughput measured, watts estimated — this box has no
+power sensors: RAPL denied, mobile Pascal exposes no power reading).**
+Per-watt ranking, TDP-based with wide bars: HD 630 (~12k H/J at ~12W
+incremental) > GTX 1050 Ti (~4.9k H/J at 75W TGP) ≈ i7-7700HQ 8 threads
+(~4.5k H/J at 45W package, 202k H/s re-measured). The iGPU wins by skipping
+VRAM/board/PCIe overhead; dGPU-vs-CPU is a wash on 2016-era silicon and
+widens toward GPUs on modern nodes. For time-to-result, run everything
+(the default); for energy on this laptop, the iGPU is the cheapest hash.
 
 **The deferred-keygen optimization in `mminer3`/`mminer4` buys nothing.**
 Measured 3 runs each: `mminer` 1,375k/1,375k/1,365k vs `mminer3`

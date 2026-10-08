@@ -188,14 +188,16 @@ preflight() {
         log "Intel OpenCL ready."
     fi
 
-    # 3. AMD OpenCL missing? (best effort, untested here — no AMD hardware)
+    # 3. AMD OpenCL missing?
     if [ "$need_amd" = "1" ]; then
         log "AMD GPU present but no AMD OpenCL platform."
-        if pkg_install "opencl-rusticl-mesa" "mesa-opencl-icd" "mesa-libOpenCL"; then
+        if pkg_install "opencl-mesa" "mesa-opencl-icd" "mesa-libOpenCL"; then
+            # Rusticl hides devices unless opted in (see Mesa docs).
+            export RUSTICL_ENABLE="${RUSTICL_ENABLE:-radeonsi}"
             log "AMD runtime installed."
         else
             print_install_cmds "AMD runtime (untested)" \
-                "opencl-rusticl-mesa" "mesa-opencl-icd" "mesa-libOpenCL"
+                "opencl-mesa" "mesa-opencl-icd" "mesa-libOpenCL"
             return 1
         fi
     fi
@@ -268,8 +270,14 @@ if [ "$USE_GPU" = "0" ]; then
 fi
 
 # Combined: GPUs (tids 0..ndev-1) + CPU (tids ndev..) under one salt.
+# Default CPU to 25% of cores: iGPU shares package power/thermals with the
+# CPU, and CPU H/J is worse, so full CPU starves the iGPU. Explicit --cpu N wins.
 [ -x ./mminer4 ] || make mminer4 || exit 1
-if [ -z "$CPU_THREADS" ]; then CPU_THREADS=$(nproc 2>/dev/null || echo 4); fi
+if [ -z "$CPU_THREADS" ]; then
+    _n=$(nproc 2>/dev/null || echo 4)
+    CPU_THREADS=$(( (_n + 3) / 4 ))
+    [ "$CPU_THREADS" -lt 1 ] && CPU_THREADS=1
+fi
 if [ -z "$SALT" ]; then SALT=$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n'); fi
 GPU_TIDS=$(./gpuminer --check 2>/dev/null | grep -c "^  gpu " || true)
 STA="$(printf '%s' "$PREFIX" | tr -c 'A-Za-z0-9+=' '_').sta2"

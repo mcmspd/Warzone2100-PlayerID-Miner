@@ -104,6 +104,55 @@ The property test re-derives the public key from the seed, checks the
 signature verifies, and asserts the prefix — the acceptance gate for any
 change to the kernel.
 
+## Portability (Linux x86-64 little-endian)
+
+The kernels are pure OpenCL C 1.2 — no vendor extensions, no inline asm —
+and should compile on any full-profile OpenCL 1.2+ GPU (NVIDIA, Intel,
+AMD). Tested only on GTX 1050 Ti + HD 630; everything else is reasoned,
+not measured.
+
+- **NVIDIA-only box**: works out of the box with the proprietary driver.
+- **Intel iGPU**: Gen11+ via distro `intel-compute-runtime`; Gen9
+  (HD/UHD 5xx-6xx) needs the legacy branch — `run.sh` fetches it
+  rootlessly when it detects the gap.
+- **AMD**: kernel should build (RadeonSI/Rusticl/ROCm all take 1.2).
+  Runtimes, in order of preference: Mesa Rusticl (all GCN/RDNA APUs
+  including old Vega — needs `RUSTICL_ENABLE=radeonsi`, set by `run.sh`;
+  ships with Mesa, nothing to install on most distros) →
+  AMDGPU-PRO PAL OpenCL (broader APU coverage, proprietary) →
+  ROCm `rocm-opencl` (only Ryzen AI 300/Max APUs on Ubuntu, ML-focused;
+  older APUs unsupported). All untested here — validate with `make check`.
+- **NVIDIA RTX 50 (Blackwell)**: no action needed — OpenCL 3.0 ships in
+  R570+ drivers (conformant since R465). Estimates only: ~30–50x a
+  GTX 1050 Ti (~10–18M H/s on a 5090), 6-char prefix in ~1–2 h.
+  Our kernel is occupancy-bound, so measure, don't trust the estimate.
+- **No GPU at all**: `gpuminer` exits cleanly; `./run.sh <PREFIX> --no-gpu`
+  falls back to the OpenMP CPU miner.
+- **`make dist` binaries**: need glibc >= the build machine's (2.44 here)
+  plus the target's own GPU driver stack. Little-endian x86-64 assumed
+  (seed `tid`/`counter` are raw `memcpy` little-endian on the host).
+- **Not supported**: Windows/macOS (`run.sh` needs `lspci`, os-release
+  package names, and Unix ICD paths), big-endian CPUs, 32-bit (untested).
+
+## Renting a farm (7–8 char prefixes)
+
+Local hardware tops out around 6 chars. For more, rent NVIDIA pods —
+`make dist` binaries deploy as-is (CUDA images ship OpenCL; only
+`libOpenCL` + libc needed). Farm recipe: same `--salt` on every box,
+disjoint `-t` tid ranges per box/GPU — no other coordination needed,
+and per-tid checkpoints make preemption nearly free, so use
+interruptible/spot instances.
+
+| target | setup (est. rates) | cost basis (2026 prices) |
+|---|---|---|
+| 7 chars (~3 d mean) | 1× RTX 5090 (~15 MH/s) | ~$56 on RunPod community ($0.69/h) |
+| 8 chars (~1 mo mean) | 10× RTX 4090 (~100 MH/s) | ~$2.4k/mo RunPod community ($0.34/h) |
+| 8 chars, budget | 14× RTX 3090 (~100 MH/s) | ~$2.2k/mo, or ~$1.3k interruptible on Vast.ai |
+
+Cheapest $/MH is usually previous-gen (3090) on community/interruptible
+tiers. Validate one box first (`make check` + one timed prefix) before
+scaling — per-GPU rates here are estimates until measured.
+
 ## Portable build (fresh PC without dev packages)
 
 ```sh
