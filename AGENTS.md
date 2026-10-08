@@ -108,15 +108,15 @@ a C implementation at all — one Python program would be far simpler for a 1.3x
 throughput gap. Only worth keeping C if you need many more cores per host or
 plan a GPU path (§7).
 
-Single-machine ETA at 133k H/s:
-| prefix | expected hashes | time |
-|---|---|---|
-| 3 chars | 262,144 | ~2 s |
-| 4 chars | 16,777,216 | ~2 min |
-| 5 chars | 1,073,741,824 | ~2.2 h |
-| 6 chars | 68,719,476,736 | ~6 days |
-| 7 chars | 4,398,046,511,104 | ~3.2 mo (single RTX 5090-class: ~3 d) |
-| 8 chars | 281,474,976,710,656 | ~17 y (**not feasible here**; needs ~109 MH/s for a 30-day mean — see below) |
+Single-machine ETA at 133k H/s (99% worst case = 4.605x mean — budget for this):
+| prefix | expected hashes | mean | budget (99%) |
+|---|---|---|---|
+| 3 chars | 262,144 | ~2 s | ~9 s |
+| 4 chars | 16,777,216 | ~2 min | ~10 min |
+| 5 chars | 1,073,741,824 | ~2.2 h | ~10 h |
+| 6 chars | 68,719,476,736 | ~6 days | ~28 days |
+| 7 chars | 4,398,046,511,104 | ~3.2 mo (single RTX 5090-class: ~3 d) | ~4.8 y locally |
+| 8 chars | 281,474,976,710,656 | ~17 y (**not feasible here**; needs ~109 MH/s for a 30-day mean — see below) | ~309 y |
 
 6+ characters is realistically a multi-device project. The user should be told
 this up front rather than discovering it at hour 6.
@@ -194,7 +194,15 @@ Measured: `TEST` (4 chars, 16.6M hashes) in 47 s; `ZZ` (2 chars) in 0.02 s.
 remaining headroom is all in the kernel. First cut done: SHA-512 `w[80]`
 → 16-word sliding window (`gpuminer.cl`) gave Intel +11% (155k→172k H/s),
 NVIDIA unchanged (378k) — total 533k→550k H/s. NVIDIA is bound in the
-`ge` chain, not SHA registers.
+`ge` chain, not SHA registers. Second cut: `-l/--local` work-group size
+(64 beat driver default +3% on the old kernel). Third cut: width-5
+fixed-base schedule (`gen_ge.py` emits `GE_BASE5[26][16]`, 52 adds + x32
+middle vs 64 adds; all 416 entries round-trip-validated against libsodium,
+and the `bench.sh` count tripwire stayed bit-identical at 12,582,912).
+588k→676k H/s at `l=64` (+15%); retune moved the optimum to `l=32` at
+**684k H/s (+28% over the 533k baseline)**. Binary default stays driver
+(`-l 0`); tune per device with `bench.sh -l` (optima differ per GPU and
+per kernel).
 
 Files: `gpuminer.c` (host: work distribution, checkpoint/resume, `.sta2`
 output) + `gpuminer.cl` (mine kernel: seed→SHA-512→clamp→`ge_scalarmult_base`→

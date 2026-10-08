@@ -294,6 +294,7 @@ for f in .gpu_checkpoint_t*.txt .cpu_checkpoint_t*.txt; do
 done
 PLEN=${#PREFIX}; [ "$PLEN" -gt 43 ] && PLEN=43
 EXPECTED=$(awk -v n="$PLEN" 'BEGIN{e=1; for(i=0;i<n;i++) e*=64; if (n==43) e/=4; printf "%.0f", e}')
+BUDGET=$(awk -v e="$EXPECTED" 'BEGIN{printf "%.0f", e*4.6052}')
 
 ./gpuminer "$PREFIX" --salt "$SALT" -b "$BATCH" --quiet >>"$GPU_LOG" 2>&1 &
 GPU_PID=$!
@@ -326,14 +327,14 @@ while kill -0 "$GPU_PID" 2>/dev/null && kill -0 "$CPU_PID" 2>/dev/null && [ ! -f
     MINED=$((SUM - INIT_SUM)); [ "$MINED" -lt 0 ] && MINED=0
     NOW=$(date +%s); EL=$((NOW - START)); [ "$EL" -lt 1 ] && EL=1
     SPD=$((MINED / EL))
-    if [ "$SPD" -gt 0 ] && [ "$EXPECTED" -gt "$MINED" ] 2>/dev/null; then
-        ETA_S=$(awk -v e="$EXPECTED" -v m="$MINED" -v s="$SPD" 'BEGIN{printf "%d", (e-m)/s}')
+    if [ "$SPD" -gt 0 ] && [ "$BUDGET" -gt "$MINED" ] 2>/dev/null; then
+        ETA_S=$(awk -v e="$BUDGET" -v m="$MINED" -v s="$SPD" 'BEGIN{printf "%d", (e-m)/s}')
         if [ "$ETA_S" -lt 60 ]; then ETA="${ETA_S}s";
         elif [ "$ETA_S" -lt 3600 ]; then ETA="$((ETA_S/60))m $((ETA_S%60))s";
         elif [ "$ETA_S" -lt 86400 ]; then ETA="$((ETA_S/3600))h $(((ETA_S%3600)/60))m";
         else ETA="$((ETA_S/86400))d $(((ETA_S%86400)/3600))h"; fi
     else ETA="--"; fi
-    printf "\r[*] Hashes: %s | Speed: %s H/s | ETA: %s   " "$(printf "%'d" "$MINED" 2>/dev/null || echo "$MINED")" "$(printf "%'d" "$SPD" 2>/dev/null || echo "$SPD")" "$ETA"
+    printf "\r[*] Hashes: %s | Speed: %s H/s | ETA (99%%): %s   " "$(printf "%'d" "$MINED" 2>/dev/null || echo "$MINED")" "$(printf "%'d" "$SPD" 2>/dev/null || echo "$SPD")" "$ETA"
 done
 echo
 cleanup

@@ -40,8 +40,9 @@ immediately. Or step by step (`make`, exports, `./gpuminer`) — see below.
 ```
 
 - `PREFIX`: wanted leading characters of the Player ID (Base64 alphabet).
-  2 chars takes seconds, 3 chars seconds, 4 chars ~1 min, 5 chars ~35 min,
-  6 chars ~1.5 days — at ~520k H/s dual-GPU (GTX 1050 Ti + HD 630).
+  Budget for the 99% worst case (4.6x the mean — lucky draw, plan unlucky):
+  2 chars seconds, 3 chars seconds, 4 chars ~2.5 min, 5 chars ~2.6 h,
+  6 chars ~7 days — at ~520k H/s dual-GPU (GTX 1050 Ti + HD 630).
 - `DEVICE_ID`: optional number mixed into the seed salt so clustered
   machines never overlap. Default is a random salt.
 - `-t TID`: thread-id tag in the seed layout (default 0). Each GPU gets

@@ -195,6 +195,7 @@ typedef struct {
     volatile unsigned long long *total;
     int quiet;
     int profile;                // per-batch kernel vs round-trip timing to stderr
+    size_t local;               // explicit work-group size, 0 = driver default
     uint64_t initial_base;        // per-thread resume point (for exact count)
     uint64_t final_base;          // counter_base at thread exit
     uint64_t win_counter;         // winner's absolute counter (winner only)
@@ -245,7 +246,14 @@ static void *worker(void *arg_) {
         struct timespec rt0, rt1;
         if (a->profile) clock_gettime(CLOCK_MONOTONIC, &rt0);
         cl_event ev = NULL;
-        chk(clEnqueueNDRangeKernel(q, k, 1, NULL, &global, NULL, 0, NULL, a->profile ? &ev : NULL), "launch");
+        const size_t *localp = NULL;
+        size_t local_sz = 0, gsize = global;
+        if (a->local) {  // explicit work-group size; round up, kernel guards gid >= count
+            local_sz = a->local;
+            gsize = ((global + local_sz - 1) / local_sz) * local_sz;
+            localp = &local_sz;
+        }
+        chk(clEnqueueNDRangeKernel(q, k, 1, NULL, &gsize, localp, 0, NULL, a->profile ? &ev : NULL), "launch");
         chk(clFinish(q), "finish");
         if (a->profile) {
             clock_gettime(CLOCK_MONOTONIC, &rt1);
@@ -350,7 +358,7 @@ int main(int argc, char *argv[]) {
     if (sodium_init() < 0) return 1;
     if (argc >= 2 && !strcmp(argv[1], "--check")) return check_mode(argv[0]);
     if (argc < 2) {
-        printf("Usage: %s <PREFIX> [DEVICE_ID] [-t TID] [-b BATCH] [--salt HEX32] [--quiet] [--profile]\n", argv[0]);
+        printf("Usage: %s <PREFIX> [DEVICE_ID] [-t TID] [-b BATCH] [--salt HEX32] [--quiet] [--profile] [-l LOCAL]\n", argv[0]);
         printf("       %s --check   list OpenCL platforms/GPUs and exit\n", argv[0]);
         return 1;
     }
@@ -361,9 +369,11 @@ int main(int argc, char *argv[]) {
     int explicit_device = 0, explicit_salt = 0, quiet = 0, profile = 0;
     uint32_t base_tid = 0;
     size_t batch = 1 << 20;
+    size_t local = 0;
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "-t") && i + 1 < argc) base_tid = (uint32_t)atoi(argv[++i]);
         else if (!strcmp(argv[i], "-b") && i + 1 < argc) batch = (size_t)atoll(argv[++i]);
+        else if (!strcmp(argv[i], "-l") && i + 1 < argc) local = (size_t)atoll(argv[++i]);
         else if (strcmp(argv[i], "--salt") == 0 && i + 1 < argc) {
             const char *hex = argv[++i];
             if (strlen(hex) != 32) { fprintf(stderr, "[-] --salt needs 32 hex chars\n"); return 1; }
@@ -393,6 +403,7 @@ int main(int argc, char *argv[]) {
     double expected = 1;
     for (size_t i = 0; i < plen && i < 42; i++) expected *= 64;
     if (plen == 43) expected /= 4;
+    double budget = expected * 4.6052;  // 99% worst case (ln 100): plan for this
 
     // Enumerate all GPUs on all platforms
     cl_platform_id plats[8]; cl_uint nplat = 0;
@@ -424,7 +435,9 @@ int main(int argc, char *argv[]) {
                i, devs[i].dn, devs[i].pn, base_tid + i);
     printf("[*] GPU match bytes    : %u full + %s\n", full_bytes, mask ? "partial" : "none");
     printf("[*] Expected Avg Hashes: %.3g\n", expected);
+    printf("[*] 99%% Budget Hashes  : %.3g (plan for this)\n", budget);
     printf("[*] Batch size         : %zu per GPU\n", batch);
+    if (local) printf("[*] Work-group size    : %zu (explicit)\n", local);
     printf("==================================================\n\n");
     }
 
@@ -449,7 +462,7 @@ int main(int argc, char *argv[]) {
         memcpy(args[i].target, target, 33);
         args[i].full_bytes = full_bytes; args[i].mask = mask; args[i].top = top;
         args[i].prefix = prefix; args[i].plen = plen; args[i].batch = batch;
-        args[i].quiet = quiet; args[i].profile = profile;
+        args[i].quiet = quiet; args[i].profile = profile; args[i].local = local;
         for (int s = 0; s < 4; s++) args[i].src[s] = src[s];
         args[i].found = &found; args[i].win_lock = &win_lock;
         args[i].winner_tid = &winner_tid;
@@ -479,12 +492,12 @@ int main(int argc, char *argv[]) {
                        + (ts_now.tv_nsec - ts_start.tv_nsec) / 1e9;
         unsigned long long mined = __atomic_load_n(&total, __ATOMIC_RELAXED);
         double speed = elapsed > 0 ? (double)mined / elapsed : 0;
-        double pct = expected > 0 ? ((double)mined / expected * 100.0) : 0;
+        double pct = budget > 0 ? ((double)mined / budget * 100.0) : 0;
         char eta[32];
-        if (speed > 0 && expected > (double)mined) format_time((expected - mined) / speed, eta, sizeof eta);
-        else strcpy(eta, (double)mined >= expected ? "0s" : "calc");
+        if (speed > 0 && budget > (double)mined) format_time((budget - mined) / speed, eta, sizeof eta);
+        else strcpy(eta, (double)mined >= budget ? "0s" : "calc");
         if (!quiet) {
-            printf("\r[*] Hashes: %llu (%.1f%% Avg) | Speed: %.0f H/s | ETA: %s   ",
+            printf("\r[*] Hashes: %llu (%.1f%% of 99%%) | Speed: %.0f H/s | ETA (99%%): %s   ",
                    mined, pct, speed, eta);
             fflush(stdout);
         }

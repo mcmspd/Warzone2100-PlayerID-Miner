@@ -121,10 +121,14 @@ int main(int argc, char *argv[]) {
     char str_avg[32];
     format_number(expected_avg_hashes, str_avg, sizeof(str_avg));
 
+    // 99% worst-case budget (ln 100 = 4.6052x mean): plan for this, not the mean.
+    double budget_avg_hashes = (double)expected_avg_hashes * 4.6052;
+
     printf("==================================================\n");
     printf("[*] Target Prefix      : '%s'\n", target_prefix);
     printf("[*] Mode               : %s\n", explicit_device ? "Manual Device ID" : "Auto-Random Device Salt");
     printf("[*] Expected Avg Hashes: %s\n", str_avg);
+    printf("[*] 99%% Budget Hashes  : %.3g (plan for this)\n", budget_avg_hashes);
     printf("[*] Worker Threads     : %d\n", num_threads);
     printf("==================================================\n\n");
 
@@ -209,11 +213,11 @@ int main(int argc, char *argv[]) {
                         double elapsed = now - start_time;
                         uint64_t current_mined = total_hashes;
                         double speed = (elapsed > 0) ? ((double)current_mined / elapsed) : 0;
-                        double pct = ((double)current_mined / (double)expected_avg_hashes) * 100.0;
+                        double pct = ((double)current_mined / budget_avg_hashes) * 100.0;
 
                         char eta_buf[32], str_mined[32], str_speed[32];
                         if (speed > 0) {
-                            double remaining = (current_mined < expected_avg_hashes) ? (double)(expected_avg_hashes - current_mined) : 0;
+                            double remaining = ((double)current_mined < budget_avg_hashes) ? (budget_avg_hashes - (double)current_mined) : 0;
                             format_time(remaining / speed, eta_buf, sizeof(eta_buf));
                         } else {
                             strcpy(eta_buf, "Calculating...");
@@ -222,7 +226,7 @@ int main(int argc, char *argv[]) {
                         format_number(current_mined, str_mined, sizeof(str_mined));
                         format_number((uint64_t)speed, str_speed, sizeof(str_speed));
 
-                        printf("\r[*] Hashes: %s (%.1f%% Avg) | Speed: %s H/s | ETA: %s   ",
+                        printf("\r[*] Hashes: %s (%.1f%% of 99%%) | Speed: %s H/s | ETA (99%%): %s   ",
                                str_mined, pct, str_speed, eta_buf);
                         fflush(stdout);
                         last_hud_time = now;
