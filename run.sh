@@ -67,6 +67,43 @@ print_install_cmds() { # print_install_cmds <desc> <arch>;<debian>;<fedora>
     echo "    Fedora: sudo dnf install -y $4"
 }
 
+# Build dependencies for `make` (compiler + OpenCL/libsodium headers+lib).
+# Previously run.sh assumed these existed and let gcc fail cryptically,
+# leaving the user to hunt down the providing packages.
+ensure_build_deps() {
+    local missing=""
+    have gcc || missing="$missing compiler"
+    have make || missing="$missing make"
+    { [ -r /usr/include/sodium.h ] || [ -r /usr/include/x86_64-linux-gnu/sodium.h ]; } \
+        || missing="$missing libsodium-headers"
+    [ -r /usr/include/CL/cl.h ] || missing="$missing opencl-headers"
+    ldconfig -p 2>/dev/null | grep -q libsodium\\.so || missing="$missing libsodium-lib"
+    [ -z "$missing" ] && return 0
+    log "missing build dependencies:$missing"
+    if pkg_install "base-devel libsodium ocl-icd opencl-headers" \
+                   "build-essential libsodium-dev ocl-icd-opencl-dev opencl-headers" \
+                   "gcc make libsodium-devel ocl-icd-devel opencl-headers"; then
+        log "build dependencies installed."
+    else
+        print_install_cmds "build tools (compiler, OpenCL + libsodium headers)" \
+            "base-devel libsodium ocl-icd opencl-headers" \
+            "build-essential libsodium-dev ocl-icd-opencl-dev opencl-headers" \
+            "gcc make libsodium-devel ocl-icd-devel opencl-headers"
+        return 1
+    fi
+    return 0
+}
+
+# Soft dependencies: clinfo (README verify step) and PyNaCl (result
+# verification). Non-fatal when uninstallable — features just skip.
+ensure_soft_deps() {
+    have clinfo || pkg_install "clinfo" "clinfo" "clinfo" >/dev/null 2>&1 \
+        || log "tip: 'clinfo' not installed (shows GPU visibility: sudo apt-get install -y clinfo)"
+    python3 -c "import nacl" 2>/dev/null \
+        || pkg_install "python-pynacl" "python3-nacl" "python3-pynacl" >/dev/null 2>&1 \
+        || log "tip: PyNaCl not installed (result verification will skip: sudo apt-get install -y python3-nacl)"
+}
+
 setup_intel_env() {
     if [ -d "$INTEL_DIR/legacy" ] && [ -d "$INTEL_VENDORS" ]; then
         export LD_LIBRARY_PATH="/usr/lib:${INTEL_LIB}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
@@ -206,6 +243,7 @@ preflight() {
 
 if [ ! -x ./gpuminer ]; then
     echo "building gpuminer first..."
+    ensure_build_deps || exit 1
     make || exit 1
 fi
 
@@ -219,6 +257,7 @@ setup_intel_env
 
 if [ ! -x ./gpuminer ]; then
     echo "building gpuminer first..."
+    ensure_build_deps || exit 1
     make gpuminer || exit 1
 fi
 
@@ -229,6 +268,7 @@ if ! preflight; then
     echo "[run.sh] continuing with available GPUs (some hardware has no OpenCL)."
 fi
 setup_intel_env
+ensure_soft_deps
 
 # --- single binary: gpuminer runs GPUs + CPU workers under one salt ---
 # (GPUs tids 0.., CPU tids after; binary defaults CPU to 25% of cores)

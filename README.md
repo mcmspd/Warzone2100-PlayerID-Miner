@@ -7,8 +7,11 @@ measured numbers, and design notes.
 
 ## Requirements
 
-- `gcc`, OpenCL headers + loader (`ocl-icd`), `libsodium`
-  (`pacman -S base-devel ocl-icd opencl-headers libsodium`)
+- `gcc`, OpenCL headers + loader (`ocl-icd`), `libsodium` — `run.sh` installs
+  these automatically (passwordless sudo when available, otherwise it prints
+  the exact command): Arch `base-devel ocl-icd opencl-headers libsodium`,
+  Debian `build-essential ocl-icd-opencl-dev opencl-headers libsodium-dev`,
+  Fedora `gcc make ocl-icd-devel opencl-headers libsodium-devel`
 - An OpenCL GPU. NVIDIA works out of the box with its driver installed.
 - Python + PyNaCl only for the integerity check (`make check`).
 
