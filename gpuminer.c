@@ -13,6 +13,7 @@
 #include <time.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <dirent.h>
 
 static void chk(cl_int e, const char *w) {
     if (e != CL_SUCCESS) { fprintf(stderr, "OpenCL FAIL %s: %d\n", w, e); exit(1); }
@@ -31,7 +32,11 @@ static char *slurp(const char *p) {
     // fall through to disk (lets a dist binary pick up local edits)
 #endif
     FILE *f = fopen(p, "rb");
-    if (!f) { fprintf(stderr, "cannot open %s\n", p); exit(1); }
+    if (!f) {
+        fprintf(stderr, "cannot open %s: run from the build directory "
+                "(or use a `make dist` binary with embedded kernels)\n", p);
+        exit(1);
+    }
     fseek(f, 0, SEEK_END); long n = ftell(f); fseek(f, 0, SEEK_SET);
     char *b = malloc(n + 1);
     if (fread(b, 1, n, f) != (size_t)n) { fprintf(stderr, "short read %s\n", p); exit(1); }
@@ -441,6 +446,94 @@ static int check_mode(const char *prog) {
     return ngpu > 0 ? 0 : 1;
 }
 
+// Self-diagnosis for missing GPU drivers (see README.md, run.sh preflight).
+// Scans PCI display controllers via sysfs (no lspci needed) and names the
+// distro packages that provide each vendor's OpenCL driver.
+static const char *distro_family(void) {
+    static char fam[16] = {0};
+    if (fam[0]) return fam;
+    snprintf(fam, sizeof fam, "unknown");
+    FILE *f = fopen("/etc/os-release", "r");
+    if (!f) return fam;
+    char line[256];
+    char id[64] = {0}, like[128] = {0};
+    while (fgets(line, sizeof line, f)) {
+        if (!strncmp(line, "ID=", 3)) snprintf(id, sizeof id, "%.63s", line + 3);
+        else if (!strncmp(line, "ID_LIKE=", 8)) snprintf(like, sizeof like, "%.127s", line + 8);
+    }
+    fclose(f);
+    if (strstr(id, "arch") || strstr(like, "arch") || strstr(id, "cachyos") ||
+        strstr(id, "endeavour") || strstr(id, "manjaro")) snprintf(fam, sizeof fam, "arch");
+    else if (strstr(id, "debian") || strstr(like, "debian") || strstr(id, "ubuntu") ||
+             strstr(id, "pop") || strstr(id, "mint")) snprintf(fam, sizeof fam, "debian");
+    else if (strstr(id, "fedora") || strstr(like, "fedora") || strstr(id, "rhel") ||
+             strstr(id, "centos")) snprintf(fam, sizeof fam, "fedora");
+    return fam;
+}
+
+static void scan_pci_gpus(int *nv, int *intel, int *amd) {
+    *nv = *intel = *amd = 0;
+    DIR *d = opendir("/sys/bus/pci/devices");
+    if (!d) return;
+    struct dirent *e;
+    char path[320], buf[32];
+    while ((e = readdir(d))) {
+        if (e->d_name[0] == '.') continue;
+        FILE *cf;
+        snprintf(path, sizeof path, "/sys/bus/pci/devices/%s/class", e->d_name);
+        cf = fopen(path, "r");
+        if (!cf) continue;
+        int is_display = (fgets(buf, sizeof buf, cf) && !strncmp(buf, "0x03", 4));
+        fclose(cf);
+        if (!is_display) continue;
+        snprintf(path, sizeof path, "/sys/bus/pci/devices/%s/vendor", e->d_name);
+        cf = fopen(path, "r");
+        if (!cf) continue;
+        int v = 0;
+        if (fscanf(cf, "%i", &v) == 1) {
+            if (v == 0x10de) *nv = 1;
+            else if (v == 0x8086) *intel = 1;
+            else if (v == 0x1002) *amd = 1;
+        }
+        fclose(cf);
+    }
+    closedir(d);
+}
+
+static void print_driver_advice(const char *why) {
+    const char *fam = distro_family();
+    int nv = 0, intel = 0, amd = 0;
+    scan_pci_gpus(&nv, &intel, &amd);
+    fprintf(stderr, "[!] No OpenCL GPU usable (%s).\n", why);
+    if (!nv && !intel && !amd)
+        fprintf(stderr, "    No PCI display GPU detected; CPU-only mining continues.\n");
+    if (nv) {
+        fprintf(stderr, "    NVIDIA GPU detected but no OpenCL platform. Install the driver, then reboot:\n");
+        if (!strcmp(fam, "arch")) fprintf(stderr, "      sudo pacman -S nvidia-dkms nvidia-utils linux-headers\n");
+        else if (!strcmp(fam, "debian")) fprintf(stderr, "      sudo apt-get install -y nvidia-driver   # then REBOOT\n");
+        else fprintf(stderr, "      NVIDIA driver via your distro (RPMFusion on Fedora), then REBOOT\n");
+    }
+    if (intel) {
+        fprintf(stderr, "    Intel GPU detected but no OpenCL platform:\n");
+        if (!strcmp(fam, "arch")) fprintf(stderr, "      sudo pacman -S intel-compute-runtime   # Gen9: AUR intel-compute-runtime-legacy-bin\n");
+        else if (!strcmp(fam, "debian")) fprintf(stderr, "      sudo apt-get install -y intel-opencl-icd   # Gen9 HD/UHD 5xx-6xx needs the legacy runtime, see README\n");
+        else fprintf(stderr, "      Intel OpenCL runtime via your distro (Gen9 needs the legacy branch, see README)\n");
+    }
+    if (amd) {
+        fprintf(stderr, "    AMD GPU detected but no OpenCL platform:\n");
+        if (!strcmp(fam, "arch")) fprintf(stderr, "      sudo pacman -S opencl-mesa   # then RUSTICL_ENABLE=radeonsi\n");
+        else if (!strcmp(fam, "debian")) fprintf(stderr, "      sudo apt-get install -y mesa-opencl-icd   # then RUSTICL_ENABLE=radeonsi\n");
+        else fprintf(stderr, "      sudo dnf install -y mesa-libOpenCL   # then RUSTICL_ENABLE=radeonsi\n");
+    }
+    if (nv || intel || amd) {
+        fprintf(stderr, "    Also needs the ICD loader + a visibility check:\n");
+        if (!strcmp(fam, "arch")) fprintf(stderr, "      sudo pacman -S ocl-icd clinfo && clinfo -l\n");
+        else if (!strcmp(fam, "debian")) fprintf(stderr, "      sudo apt-get install -y ocl-icd-libopencl1 clinfo && clinfo -l\n");
+        else fprintf(stderr, "      install ocl-icd + clinfo via your distro, then: clinfo -l\n");
+        fprintf(stderr, "    ./run.sh installs all of this automatically.\n");
+    }
+}
+
 int main(int argc, char *argv[]) {
     if (sodium_init() < 0) return 1;
     if (argc >= 2 && !strcmp(argv[1], "--check")) return check_mode(argv[0]);
@@ -512,13 +605,18 @@ int main(int argc, char *argv[]) {
 
     // CPU default resolves after enumeration (depends on ndev); see below.
 
-    // Enumerate all GPUs on all platforms (skipped with --no-gpu)
+    // Enumerate all GPUs on all platforms (skipped with --no-gpu).
+    // Loader/driver problems are diagnosed, not fatal: fall back to CPU
+    // workers so the search still runs. Only --cpu 0 with no GPU is an error.
     cl_platform_id plats[8]; cl_uint nplat = 0;
     typedef struct { cl_platform_id p; cl_device_id d; char pn[128], dn[128]; } devinfo;
     devinfo devs[16]; int ndev = 0;
+    int gpu_broken = 0;
     if (!no_gpu) {
-    chk(clGetPlatformIDs(8, plats, &nplat), "plats");
-    for (cl_uint pi = 0; pi < nplat && ndev < 16; pi++) {
+    cl_int perr = clGetPlatformIDs(8, plats, &nplat);
+    if (perr != CL_SUCCESS || nplat == 0) {
+        gpu_broken = 1;
+    } else for (cl_uint pi = 0; pi < nplat && ndev < 16; pi++) {
         cl_device_id ds[16]; cl_uint nd = 0;
         if (clGetDeviceIDs(plats[pi], CL_DEVICE_TYPE_GPU, 16, ds, &nd) != CL_SUCCESS) continue;
         char pn[128] = {0};
@@ -530,7 +628,10 @@ int main(int argc, char *argv[]) {
             ndev++;
         }
     }
+    if (ndev == 0) gpu_broken = 1;
     }
+    if (gpu_broken && !no_gpu)
+        print_driver_advice(nplat == 0 ? "no OpenCL platforms (loader found no drivers)" : "platforms present but expose no GPU devices");
     if (ndev == 0 && cpu_threads == 0) {
         fprintf(stderr, "no workers: no GPU devices found and --cpu 0\n"); return 1;
     }
