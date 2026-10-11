@@ -40,18 +40,30 @@ bench: gpuminer
 # Dynamic deps left: libc + libOpenCL + libdl (the GPU driver stack, which
 # cannot be static — OpenCL finds drivers via dlopen by design).
 # The target PC still needs a working OpenCL driver + ICD loader.
+# NOTE: libsodium's configure refuses build dirs containing whitespace
+# (libtool limitation), so checkouts under a path with spaces build it
+# under ~/.cache instead. Override with BUILD_ROOT=<space-free dir>.
+empty :=
+space := $(empty) $(empty)
+ifeq (,$(findstring $(space),$(CURDIR)))
+BUILD_ROOT ?= build
+else
+BUILD_ROOT ?= $(HOME)/.cache/wzminer-build
+endif
 SODIUM_VERSION = 1.0.22
-SODIUM_TGZ = build/libsodium-$(SODIUM_VERSION).tar.gz
+SODIUM_TGZ = $(BUILD_ROOT)/libsodium-$(SODIUM_VERSION).tar.gz
 SODIUM_URL = https://download.libsodium.org/libsodium/releases/libsodium-$(SODIUM_VERSION).tar.gz
-SODIUM_A = build/sodium-static/lib/libsodium.a
+SODIUM_A = $(BUILD_ROOT)/sodium-static/lib/libsodium.a
+SODIUM_PREFIX = $(abspath $(BUILD_ROOT))/sodium-static
 
 $(SODIUM_TGZ):
-	mkdir -p build
+	mkdir -p $(BUILD_ROOT)
 	curl -sSL -o $@ $(SODIUM_URL)
 
 $(SODIUM_A): $(SODIUM_TGZ)
-	cd build && tar xzf $(notdir $(SODIUM_TGZ))
-	cd build/libsodium-$(SODIUM_VERSION) && ./configure --disable-shared --enable-static --prefix=$(CURDIR)/build/sodium-static >/dev/null && make -j$$(nproc) >/dev/null && make install >/dev/null
+	mkdir -p $(BUILD_ROOT)
+	cd $(BUILD_ROOT) && tar xzf $(notdir $(SODIUM_TGZ))
+	cd $(BUILD_ROOT)/libsodium-$(SODIUM_VERSION) && ./configure --disable-shared --enable-static --prefix="$(SODIUM_PREFIX)" >/dev/null && make -j$$(nproc) >/dev/null && make install >/dev/null
 	touch $@
 
 kernels_embed.c: $(CL_SRCS) gen_embed.py
@@ -59,8 +71,8 @@ kernels_embed.c: $(CL_SRCS) gen_embed.py
 
 dist: $(SODIUM_A) kernels_embed.c
 	mkdir -p dist
-	$(CC) $(CFLAGS) $(LDFLAGS) -DKERNELS_EMBEDDED -I$(CURDIR)/build/sodium-static/include -o dist/gpuminer gpuminer.c kernels_embed.c $(CURDIR)/build/sodium-static/lib/libsodium.a -lOpenCL -static-libgcc
-	$(CC) $(CFLAGS) -O2 -fopenmp -static-libgcc -I$(CURDIR)/build/sodium-static/include -o dist/mminer4 mminer4.c $(CURDIR)/build/sodium-static/lib/libsodium.a
+	$(CC) $(CFLAGS) $(LDFLAGS) -DKERNELS_EMBEDDED -I"$(SODIUM_PREFIX)/include" -o dist/gpuminer gpuminer.c kernels_embed.c "$(SODIUM_PREFIX)/lib/libsodium.a" -lOpenCL -static-libgcc
+	$(CC) $(CFLAGS) -O2 -fopenmp -static-libgcc -I"$(SODIUM_PREFIX)/include" -o dist/mminer4 mminer4.c "$(SODIUM_PREFIX)/lib/libsodium.a"
 	@echo "--- dist contents ---"
 	@ls -la dist/
 	@echo "--- dynamic deps (must exist on target) ---"
